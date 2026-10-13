@@ -1,4 +1,4 @@
-"""Gatekeeper tests — the gate must block real regressions and pass healthy runs."""
+"""Gatekeeper tests — the gate must block regressions and pass improvements."""
 import json
 import sys
 from pathlib import Path
@@ -6,114 +6,149 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from gatekeeper import Baseline, GateResult, check
+from gatekeeper import DEFAULT_METRICS, evaluate, extract_metrics, gate, load_bench
 
 
-def base(**kw) -> Baseline:
-    d = {"success_rate": 0.95, "latency_p95_s": 2.0, "samples": 50}
-    d.update(kw)
-    return Baseline(**d)
+def batcher_bench(conc_results):
+    return {"results": [{"concurrency": c, "aggregate_tok_s": agg,
+                         "completion_tok_s": comp, "per_stream_tok_s": ps,
+                         "wall_p50_s": p50, "wall_p95_s": p95, "failed": f}
+                        for c, agg, comp, ps, p50, p95, f in conc_results]}
 
 
-# ---------------------------------------------------------------- pass cases
+def spinal_bench(ttfts, totals, n_failed=0):
+    traces = [{"ttftMs": t, "totalMs": s, "failed": False} for t, s in zip(ttfts, totals)]
+    traces += [{"failed": True} for _ in range(n_failed)]
+    return {"traces": traces}
 
-def test_healthy_run_passes():
-    r = check(base(), base(), state_path=None)
+
+# ---------------------------------------------------------------- extraction
+
+def test_extract_batcher_shape():
+    bench = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    m = extract_metrics(bench)
+    assert m["c1_aggregate_tok_s"] == 43.8
+    assert m["c1_failed"] == 0
+
+
+def test_extract_spinal_shape():
+    bench = spinal_bench([300, 400, 500, 600, 700], [4000, 5000, 6000, 7000, 8000])
+    m = extract_metrics(bench)
+    assert m["ttft_p50_ms"] == 500
+    assert m["ttft_p95_ms"] == 700
+    assert m["failed"] == 0
+
+
+def test_extract_unknown_shape_raises():
+    with pytest.raises(ValueError):
+        extract_metrics({"nope": 1})
+
+
+# ---------------------------------------------------------------- gate verdicts
+
+def test_identical_benchmarks_pass():
+    b = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    r = evaluate(b, b)
     assert r.verdict == "pass"
-    assert not any("consecutive failures" in x for x in r.reasons)
+    assert r.exit_code() == 0
 
 
-def test_tiny_success_drop_within_tolerance_passes():
-    r = check(base(), base(success_rate=0.94), state_path=None)  # 1pt drop < 2pt max
+def test_improvement_passes():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 50.0, 40.0, 40.0, 2.5, 4.5, 0)])
+    r = evaluate(base, cand)
     assert r.verdict == "pass"
+    assert r.improvements  # aggregate improved
 
 
-def test_small_latency_regression_within_tolerance_passes():
-    r = check(base(), base(latency_p95_s=2.2), state_path=None)  # 10% < 15% max
-    assert r.verdict == "pass"
-
-
-# ---------------------------------------------------------------- fail cases
-
-def test_success_drop_blocks():
-    r = check(base(), base(success_rate=0.90), state_path=None)  # 5pt drop > 2pt
-    assert r.verdict == "fail"
-    assert any("success dropped" in x for x in r.reasons)
+def test_throughput_regression_blocks():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 35.0, 28.0, 28.0, 2.9, 5.3, 0)])  # -20% throughput
+    r = evaluate(base, cand)
+    assert r.verdict == "regress"
+    assert r.exit_code() == 2
+    assert any("aggregate_tok_s" in x for x in r.regressions)
 
 
 def test_latency_regression_blocks():
-    r = check(base(), base(latency_p95_s=2.5), state_path=None)  # 25% > 15%
-    assert r.verdict == "fail"
-    assert any("latency regressed" in x for x in r.reasons)
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 43.8, 35.6, 35.6, 4.5, 8.0, 0)])  # p50 +55%
+    r = evaluate(base, cand)
+    assert r.verdict == "regress"
+    assert any("wall_p50_s" in x for x in r.regressions)
 
 
-def test_both_failing_blocks():
-    r = check(base(), base(success_rate=0.90, latency_p95_s=2.5), state_path=None)
-    assert r.verdict == "fail"
-    assert len([x for x in r.reasons if "consecutive" in x]) == 2
+def test_new_failure_always_blocks():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 1)])  # 1 failure
+    r = evaluate(base, cand)
+    assert r.verdict == "regress"
+    assert any("failed" in x for x in r.regressions)
 
 
-# ---------------------------------------------------------------- skip cases
-
-def test_few_samples_skips():
-    r = check(base(), base(samples=5), state_path=None)
-    assert r.verdict == "skip"
-    assert any("samples" in x for x in r.reasons)
-
-
-# ---------------------------------------------------------------- hysteresis
-
-def test_flaky_failure_needs_streak_to_block(tmp_path):
-    state = tmp_path / "state.json"
-    # first failure: warning only
-    r1 = check(base(), base(success_rate=0.90), state_path=state)
-    assert r1.verdict == "pass"
-    assert any("warning only" in x for x in r1.reasons)
-    # second consecutive failure: blocks
-    r2 = check(base(), base(success_rate=0.90), state_path=state)
-    assert r2.verdict == "fail"
+def test_small_noise_within_tolerance_passes():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 42.5, 34.5, 34.5, 3.0, 5.4, 0)])  # ~3% noise
+    r = evaluate(base, cand)
+    assert r.verdict == "pass"
 
 
-def test_streak_resets_on_pass(tmp_path):
-    state = tmp_path / "state.json"
-    check(base(), base(success_rate=0.90), state_path=state)   # fail 1
-    check(base(), base(), state_path=state)                    # pass resets
-    r3 = check(base(), base(success_rate=0.90), state_path=state)  # fail 1 again
-    assert r3.verdict == "pass"  # streak was reset
+def test_custom_tolerance_tightens():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 42.5, 34.5, 34.5, 2.9, 5.3, 0)])  # -3% throughput
+    r_default = evaluate(base, cand)  # 5% default → pass
+    r_tight = evaluate(base, cand, tolerances={"c1_aggregate_tok_s": 0.01})
+    assert r_default.verdict == "pass"
+    assert r_tight.verdict == "regress"
 
 
-def test_hysteresis_one_blocks_immediately(tmp_path):
-    state = tmp_path / "state.json"
-    r = check(base(), base(success_rate=0.90), hysteresis=1, state_path=state)
-    assert r.verdict == "fail"
+def test_spinal_ttft_regression_blocks():
+    base = spinal_bench([300, 320, 340, 360, 380], [4000] * 5)
+    cand = spinal_bench([500, 520, 540, 560, 580], [4000] * 5)  # ttft +60%
+    r = evaluate(base, cand)
+    assert r.verdict == "regress"
+    assert any("ttft" in x for x in r.regressions)
 
 
-# ---------------------------------------------------------------- baseline io
+# ---------------------------------------------------------------- errors
 
-def test_baseline_roundtrip(tmp_path):
-    bl = base(meta={"model": "glm-5.3-flash"})
-    p = tmp_path / "baseline.json"
-    bl.save(p)
-    bl2 = Baseline.load(p)
-    assert bl2.success_rate == bl.success_rate
-    assert bl2.latency_p95_s == bl.latency_p95_s
-    assert bl2.meta.get("model") == "glm-5.3-flash"
+def test_missing_baseline_is_error():
+    r = gate("/nonexistent/base.json", "/nonexistent/cand.json")
+    assert r.verdict == "error"
+    assert r.exit_code() == 1
 
 
-def test_baseline_from_ok_failed():
-    bl = Baseline.from_results({"ok": 95, "failed": 5, "latency_p95_s": 2.0, "requests": 100})
-    assert bl.success_rate == 0.95
-    assert bl.samples == 100
+def test_malformed_candidate_is_error():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    r = evaluate(base, {"unrecognized": True})
+    assert r.verdict == "error"
 
 
-def test_baseline_requires_metrics():
-    with pytest.raises(ValueError):
-        Baseline.from_results({"foo": 1})
+# ---------------------------------------------------------------- shape skew
+
+def test_shape_skew_ignores_missing_metrics():
+    """Baseline batcher vs candidate spinal: common metrics only (failed)."""
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = spinal_bench([300, 400], [4000, 5000])
+    r = evaluate(base, cand)
+    # 'failed' is the only shared metric; 0 == 0 → no regression
+    assert r.verdict == "pass"
 
 
-# ---------------------------------------------------------------- serialization
+# ---------------------------------------------------------------- file roundtrip
 
-def test_gate_result_serializable():
-    r = check(base(), base(success_rate=0.90), state_path=None)
+def test_gate_end_to_end(tmp_path):
+    base_f = tmp_path / "base.json"
+    cand_f = tmp_path / "cand.json"
+    base_f.write_text(json.dumps(batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])))
+    cand_f.write_text(json.dumps(batcher_bench([(1, 30.0, 25.0, 25.0, 4.0, 7.0, 0)])))
+    r = gate(str(base_f), str(cand_f))
+    assert r.verdict == "regress"
+    assert len(r.regressions) >= 2
+
+
+def test_result_serializable():
+    base = batcher_bench([(1, 43.8, 35.6, 35.6, 2.9, 5.3, 0)])
+    cand = batcher_bench([(1, 30.0, 25.0, 25.0, 4.0, 7.0, 0)])
+    r = evaluate(base, cand)
     json.dumps(r.to_dict())  # must not raise
-    assert r.to_dict()["verdict"] == "fail"
