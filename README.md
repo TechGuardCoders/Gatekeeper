@@ -67,3 +67,18 @@ python -m pytest tests/ -q   # 16 tests
 ```
 
 Every verdict path has a test: regressions block, improvements pass, noise within tolerance passes, new failures always block, custom tolerances tighten, shape skew is ignored, and errors fail closed.
+
+## Docker
+
+Multi-stage, multi-arch image (amd64 + arm64), runs as non-root.
+
+```bash
+# Build for your local arch
+docker build -t gatekeeper .
+
+# Build for both arches with buildx
+docker buildx build --platform linux/amd64,linux/arm64 -t gatekeeper .
+
+# Run
+docker run --rm gatekeeper /data/baseline.json /data/candidate.json
+```

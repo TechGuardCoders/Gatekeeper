@@ -11,3 +11,10 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install pytest
       - run: python -m pytest tests/ -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker build smoke test
+        run: docker build .
